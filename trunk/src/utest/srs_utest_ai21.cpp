@@ -3814,6 +3814,7 @@ srs_error_t MockRtspConnection::do_send_packet(SrsRtpPacket *pkt)
     srs_freep(last_packet_);
     if (pkt) {
         last_packet_ = pkt->copy();
+        sequences_.push_back(pkt->header_.get_sequence());
     }
 
     return srs_error_copy(send_error_);
@@ -3833,6 +3834,7 @@ void MockRtspConnection::set_send_error(srs_error_t err)
 void MockRtspConnection::reset()
 {
     do_send_packet_count_ = 0;
+    sequences_.clear();
     srs_freep(last_packet_);
     srs_freep(send_error_);
 }

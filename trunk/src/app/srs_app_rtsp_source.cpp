@@ -18,6 +18,7 @@
 #include <srs_kernel_error.hpp>
 #include <srs_kernel_kbps.hpp>
 #include <srs_kernel_log.hpp>
+#include <srs_kernel_rtc_queue.hpp>
 #include <srs_kernel_utility.hpp>
 #include <srs_protocol_rtp.hpp>
 #include <srs_protocol_utility.hpp>
@@ -1053,10 +1054,12 @@ SrsRtspSendTrack::SrsRtspSendTrack(ISrsRtspConnection *session, SrsRtcTrackDescr
 {
     session_ = session;
     track_desc_ = track_desc->copy();
+    rtp_queue_ = new SrsRtpRingBuffer(is_audio ? 100 : 1000);
 }
 
 SrsRtspSendTrack::~SrsRtspSendTrack()
 {
+    srs_freep(rtp_queue_);
     srs_freep(track_desc_);
 }
 
@@ -1088,6 +1091,39 @@ SrsRtcTrackDescription *SrsRtspSendTrack::track_desc()
     return track_desc_;
 }
 
+srs_error_t SrsRtspSendTrack::on_nack(const std::vector<uint16_t> &lost_seqs)
+{
+    srs_error_t err = srs_success;
+
+    for (int i = 0; i < (int)lost_seqs.size(); i++) {
+        uint16_t seq = lost_seqs.at(i);
+        SrsRtpPacket *pkt = fetch_rtp_packet(seq);
+        if (!pkt) {
+            continue;
+        }
+
+        if ((err = session_->do_send_packet(pkt)) != srs_success) {
+            return srs_error_wrap(err, "resend seq=%u", seq);
+        }
+    }
+
+    return err;
+}
+
+SrsRtpPacket *SrsRtspSendTrack::fetch_rtp_packet(uint16_t seq)
+{
+    SrsRtpPacket *pkt = rtp_queue_->at(seq);
+    if (!pkt || pkt->header_.get_sequence() != seq) {
+        return NULL;
+    }
+    return pkt;
+}
+
+void SrsRtspSendTrack::reset_rtp_cache()
+{
+    rtp_queue_->clear_all_histroy();
+}
+
 SrsRtspAudioSendTrack::SrsRtspAudioSendTrack(ISrsRtspConnection *session, SrsRtcTrackDescription *track_desc)
     : SrsRtspSendTrack(session, track_desc, true)
 {
@@ -1117,6 +1153,8 @@ srs_error_t SrsRtspAudioSendTrack::on_rtp(SrsRtpPacket *pkt)
     } else {
         // TODO: FIXME: Should update PT for RTX.
     }
+
+    rtp_queue_->set(pkt->header_.get_sequence(), pkt->copy());
 
     if ((err = session_->do_send_packet(pkt)) != srs_success) {
         return srs_error_wrap(err, "raw send");
@@ -1157,6 +1195,8 @@ srs_error_t SrsRtspVideoSendTrack::on_rtp(SrsRtpPacket *pkt)
     } else {
         // TODO: FIXME: Should update PT for RTX.
     }
+
+    rtp_queue_->set(pkt->header_.get_sequence(), pkt->copy());
 
     if ((err = session_->do_send_packet(pkt)) != srs_success) {
         return srs_error_wrap(err, "raw send");

@@ -34,6 +34,7 @@ class ISrsClock;
 class ISrsAppFactory;
 class ISrsRtcSSRCGenerator;
 class ISrsRand;
+class SrsRtpRingBuffer;
 
 // The RTSP stream consumer, consume packets from RTSP stream source.
 class SrsRtspConsumer
@@ -317,6 +318,8 @@ public:
     virtual std::string get_track_id() = 0;
     virtual SrsRtcTrackDescription *track_desc() = 0;
     virtual srs_error_t on_rtp(SrsRtpPacket *pkt) = 0;
+    virtual srs_error_t on_nack(const std::vector<uint16_t> &lost_seqs) = 0;
+    virtual void reset_rtp_cache() = 0;
 };
 
 class SrsRtspSendTrack : public ISrsRtspSendTrack
@@ -329,6 +332,8 @@ public:
 SRS_DECLARE_PROTECTED: // clang-format on
     // The owner connection for this track.
     ISrsRtspConnection *session_;
+    // The packets sent recently, for RTCP Generic NACK retransmission.
+    SrsRtpRingBuffer *rtp_queue_;
 
 public:
     SrsRtspSendTrack(ISrsRtspConnection *session, SrsRtcTrackDescription *track_desc, bool is_audio);
@@ -341,6 +346,11 @@ public:
     bool get_track_status();
     std::string get_track_id();
     virtual SrsRtcTrackDescription *track_desc();
+    virtual srs_error_t on_nack(const std::vector<uint16_t> &lost_seqs);
+    virtual void reset_rtp_cache();
+
+public:
+    SrsRtpPacket *fetch_rtp_packet(uint16_t seq);
 };
 
 class SrsRtspAudioSendTrack : public SrsRtspSendTrack

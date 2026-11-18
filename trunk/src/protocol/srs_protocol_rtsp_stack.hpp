@@ -17,6 +17,7 @@ class SrsBuffer;
 class SrsSimpleStream;
 class SrsParsedAudioPacket;
 class ISrsProtocolReadWriter;
+class ISrsRtspTransportHandler;
 
 // From rtsp specification
 // CR = <US-ASCII CR, carriage return (13)>
@@ -367,6 +368,17 @@ public:
     // @param res the rtsp response message, which user should never free it.
     // @return an int error code.
     virtual srs_error_t send_message(SrsRtspResponse *res) = 0;
+    virtual void set_rtcp_handler(ISrsRtspTransportHandler *h);
+};
+
+class ISrsRtspTransportHandler
+{
+public:
+    ISrsRtspTransportHandler();
+    virtual ~ISrsRtspTransportHandler();
+
+public:
+    virtual srs_error_t on_rtcp(uint8_t channel, char *data, int size) = 0;
 };
 
 // The rtsp protocol stack to parse the rtsp packets.
@@ -377,6 +389,8 @@ private:
     SrsSimpleStream *buf_;
     // The underlayer socket object, send/recv bytes.
     ISrsProtocolReadWriter *skt_;
+    // The handler for RTCP packets carried by interleaved channels.
+    ISrsRtspTransportHandler *rtcp_handler_;
 
 public:
     SrsRtspStack(ISrsProtocolReadWriter *s);
@@ -393,6 +407,7 @@ public:
     //         ERROR_RTSP_NEED_MORE_DATA if more data is needed to complete the frame.
     //         ERROR_RTSP_TOKEN_NOT_NORMAL if the data is not an RTCP interleaved frame.
     virtual srs_error_t try_consume_rtcp_frame();
+    virtual void set_rtcp_handler(ISrsRtspTransportHandler *h);
     // Send rtsp message over underlayer io.
     // @param res the rtsp response message, which user should never free it.
     // @return an int error code.

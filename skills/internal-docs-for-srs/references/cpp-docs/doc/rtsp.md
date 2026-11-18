@@ -80,6 +80,21 @@ There are currently no plans to support UDP transport. In practice, UDP is rarel
 
 When using TCP transport, each RTP/RTCP packet has an additional 4-byte header. The first byte is fixed at `0x24`, followed by a 1-byte channel identifier, followed by a 2-byte RTP packet length. See section 10.12 `Embedded (Interleaved) Binary Data` in `RFC2326`.
 
+SETUP uses the `interleaved` range as an RTP/RTCP pair. SRS sends RTP on the first channel and accepts RTCP on the second channel, such as `interleaved=0-1` for RTP channel 0 and RTCP channel 1.
+
+### RTP Retransmission
+
+SRS keeps a bounded cache of recently sent RTP packets for each RTSP track: 100 packets for audio and 1000 packets for video. When the player sends an RTCP Generic NACK (`RFC 4585`, RTPFB with FMT 1), SRS matches the media SSRC to the track and resends the requested sequence numbers on the same interleaved RTP channel.
+
+- The SDP advertises `a=rtcp-fb:<payload-type> nack` for both audio and video, so a player knows it may request retransmission.
+- Each requested sequence number is looked up exactly. A packet that has already left the cache, or was never sent, is ignored instead of being replaced by a packet with the same 16-bit position.
+- Out-of-order, sparse, and duplicate NACK requests are safe: each sequence is handled independently, and later live packets keep their places. The live stream is not reordered; only the repair request is matched to the cached sequence.
+- The cache is filled in send order, but accepts any RTP sequence number, so packets that arrive out of order at SRS can still be retransmitted later.
+- Retransmissions are best-effort and share the same TCP connection as normal RTP. TCP already guarantees byte delivery, so this repairs drops that happen before the send path, such as an application-level queue drop, or packets a player asks for again. It is not UDP and does not make RTSP UDP transport available.
+- Resending uses the cached packet as-is, including its negotiated SSRC, payload type, timestamp, and sequence number. A retransmission does not replace the cached copy.
+
+The sender and the RTCP reader run as separate coroutines on the connection. SRS serializes both send paths with one lock, so an interleaved header and its payload are never interleaved with another RTP frame on the TCP stream.
+
 ## Play Before Publish
 
 RTSP supports audio with AAC and OPUS codecs, which is significantly different from RTMP or WebRTC.
@@ -111,6 +126,12 @@ For the business logic, `SrsRtspConnection` handles client connections and proto
 ```bash
 ./configure --utest=on & make utest
 ./objs/srs_utest
+```
+
+The RTP-over-TCP retransmission cases are:
+
+```bash
+./objs/srs_utest --gtest_filter='RtspStackTest.InterleavedNackReachesHandler:RtspConnectionTest.SetupRegistersRtcpChannel:RtspConnectionTest.DispatchesInterleavedNackToPlayer:RtspSendTrackTest.*:RtspPlayStreamTest.RtcpNackRoutesToMatchingTrack'
 ```
 
 ### Regression Test

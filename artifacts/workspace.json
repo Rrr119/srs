@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid23363",
+  "B": "/home/dev/feedback/uid23363",
+  "sha": "b27939e18d064bc8c41ad04d94d56e72bc79b9ed",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "ossrs",
+    "repo": "srs",
+    "sha": "b27939e18d064bc8c41ad04d94d56e72bc79b9ed"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "srs",
+    "cloneUrl": "https://github.com/Rrr119/srs.git"
+  },
+  "at": "2026-11-18T08:01:08.227Z"
+}

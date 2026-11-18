@@ -407,10 +407,23 @@ ISrsRtspStack::~ISrsRtspStack()
 {
 }
 
+void ISrsRtspStack::set_rtcp_handler(ISrsRtspTransportHandler *h)
+{
+}
+
+ISrsRtspTransportHandler::ISrsRtspTransportHandler()
+{
+}
+
+ISrsRtspTransportHandler::~ISrsRtspTransportHandler()
+{
+}
+
 SrsRtspStack::SrsRtspStack(ISrsProtocolReadWriter *s)
 {
     buf_ = new SrsSimpleStream();
     skt_ = s;
+    rtcp_handler_ = NULL;
 }
 
 SrsRtspStack::~SrsRtspStack()
@@ -770,6 +783,7 @@ srs_error_t SrsRtspStack::recv_token(std::string &token, SrsRtspTokenState &stat
 
 srs_error_t SrsRtspStack::try_consume_rtcp_frame()
 {
+    srs_error_t err = srs_success;
     char *data = buf_->bytes();
 
     // Check for RTCP over TCP format: $ + channel + length(2 bytes)
@@ -796,6 +810,9 @@ srs_error_t SrsRtspStack::try_consume_rtcp_frame()
             // This is an RTCP packet in RTSP over TCP format
             srs_trace("RTSP: Consuming RTCP packet(%d), channel=%d, size=%d bytes",
                       (uint8_t)data[5], channel, payload_length);
+            if (rtcp_handler_ && (err = rtcp_handler_->on_rtcp(channel, data + 4, payload_length)) != srs_success) {
+                return srs_error_wrap(err, "handle rtcp");
+            }
             buf_->erase(total_frame_size);
             return srs_success;
         } else {
@@ -809,4 +826,9 @@ srs_error_t SrsRtspStack::try_consume_rtcp_frame()
 
     // Not an interleaved frame (RTP/RTCP over TCP)
     return srs_error_new(ERROR_RTSP_TOKEN_NOT_NORMAL, "not interleaved frame");
+}
+
+void SrsRtspStack::set_rtcp_handler(ISrsRtspTransportHandler *h)
+{
+    rtcp_handler_ = h;
 }

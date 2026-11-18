@@ -413,6 +413,8 @@ public:
     int on_rtp_count_;
     uint32_t last_ssrc_;
     uint16_t last_sequence_;
+    int on_nack_count_;
+    std::vector<uint16_t> nack_seqs_;
 
 public:
     MockRtspSendTrack(std::string track_id, SrsRtcTrackDescription *desc);
@@ -423,6 +425,8 @@ public:
     virtual std::string get_track_id();
     virtual SrsRtcTrackDescription *track_desc();
     virtual srs_error_t on_rtp(SrsRtpPacket *pkt);
+    virtual srs_error_t on_nack(const std::vector<uint16_t> &lost_seqs);
+    virtual void reset_rtp_cache();
     void reset();
 };
 
@@ -510,6 +514,9 @@ public:
     bool set_all_tracks_status_value_;
     srs_error_t initialize_error_;
     srs_error_t start_error_;
+    int on_rtcp_nack_count_;
+    uint32_t last_nack_ssrc_;
+    std::vector<uint16_t> last_nack_seqs_;
 
 public:
     MockRtspPlayStream();
@@ -520,6 +527,7 @@ public:
     virtual srs_error_t start();
     virtual void stop();
     virtual void set_all_tracks_status(bool status);
+    virtual srs_error_t on_rtcp_nack(uint32_t ssrc, const std::vector<uint16_t> &lost_seqs);
     void reset();
 };
 

@@ -17,6 +17,7 @@ using namespace std;
 #include <srs_kernel_error.hpp>
 #include <srs_kernel_flv.hpp>
 #include <srs_kernel_mp4.hpp>
+#include <srs_kernel_rtc_rtcp.hpp>
 #include <srs_kernel_utility.hpp>
 #include <srs_protocol_amf0.hpp>
 #include <srs_protocol_utility.hpp>
@@ -1776,6 +1777,7 @@ MockRtspSendTrack::MockRtspSendTrack(std::string track_id, SrsRtcTrackDescriptio
     on_rtp_count_ = 0;
     last_ssrc_ = 0;
     last_sequence_ = 0;
+    on_nack_count_ = 0;
 }
 
 MockRtspSendTrack::~MockRtspSendTrack()
@@ -1808,11 +1810,24 @@ srs_error_t MockRtspSendTrack::on_rtp(SrsRtpPacket *pkt)
     return srs_success;
 }
 
+srs_error_t MockRtspSendTrack::on_nack(const std::vector<uint16_t> &lost_seqs)
+{
+    on_nack_count_++;
+    nack_seqs_ = lost_seqs;
+    return srs_success;
+}
+
+void MockRtspSendTrack::reset_rtp_cache()
+{
+}
+
 void MockRtspSendTrack::reset()
 {
     on_rtp_count_ = 0;
     last_ssrc_ = 0;
     last_sequence_ = 0;
+    on_nack_count_ = 0;
+    nack_seqs_.clear();
 }
 
 // MockRtspStack implementation
@@ -1887,6 +1902,8 @@ MockRtspPlayStream::MockRtspPlayStream()
     set_all_tracks_status_value_ = false;
     initialize_error_ = srs_success;
     start_error_ = srs_success;
+    on_rtcp_nack_count_ = 0;
+    last_nack_ssrc_ = 0;
 }
 
 MockRtspPlayStream::~MockRtspPlayStream()
@@ -1918,6 +1935,14 @@ void MockRtspPlayStream::set_all_tracks_status(bool status)
     set_all_tracks_status_value_ = status;
 }
 
+srs_error_t MockRtspPlayStream::on_rtcp_nack(uint32_t ssrc, const std::vector<uint16_t> &lost_seqs)
+{
+    on_rtcp_nack_count_++;
+    last_nack_ssrc_ = ssrc;
+    last_nack_seqs_ = lost_seqs;
+    return srs_success;
+}
+
 void MockRtspPlayStream::reset()
 {
     initialize_called_ = false;
@@ -1927,6 +1952,9 @@ void MockRtspPlayStream::reset()
     set_all_tracks_status_value_ = false;
     srs_freep(initialize_error_);
     srs_freep(start_error_);
+    on_rtcp_nack_count_ = 0;
+    last_nack_ssrc_ = 0;
+    last_nack_seqs_.clear();
 }
 
 // MockStreamWriterForRtspConn implementation
@@ -3407,6 +3435,7 @@ VOID TEST(RtspConnectionTest, DoDescribeWithAudioAndVideo)
     EXPECT_TRUE(sdp.find("RTP/AVP") != std::string::npos);
     EXPECT_TRUE(sdp.find("MPEG4-GENERIC") != std::string::npos);
     EXPECT_TRUE(sdp.find("a=rtpmap:97 MPEG4-GENERIC/48000/2") != std::string::npos);
+    EXPECT_TRUE(sdp.find("a=rtcp-fb:97 nack") != std::string::npos);
 
     // Verify AAC fmtp line is present with config
     EXPECT_TRUE(sdp.find("a=fmtp:97") != std::string::npos);
@@ -3418,6 +3447,7 @@ VOID TEST(RtspConnectionTest, DoDescribeWithAudioAndVideo)
     EXPECT_TRUE(sdp.find("m=video") != std::string::npos);
     EXPECT_TRUE(sdp.find("H264") != std::string::npos);
     EXPECT_TRUE(sdp.find("a=rtpmap:96 H264/90000") != std::string::npos);
+    EXPECT_TRUE(sdp.find("a=rtcp-fb:96 nack") != std::string::npos);
 
     // Verify control URLs are present
     EXPECT_TRUE(sdp.find("a=control:") != std::string::npos);
@@ -4228,6 +4258,83 @@ VOID TEST(RtspTcpNetworkTest, WriteRtpPacket)
     EXPECT_EQ(0, memcmp(rtp_packet, output + 4, kRtpPacketSize));
 }
 
+static std::string rtsp_test_nack(uint32_t media_ssrc, const std::vector<uint16_t> &lost_seqs)
+{
+    char buf[kRtcpPacketSize];
+    SrsBuffer stream(buf, sizeof(buf));
+
+    SrsRtcpNack nack(0x11223344);
+    nack.set_media_ssrc(media_ssrc);
+    for (int i = 0; i < (int)lost_seqs.size(); i++) {
+        nack.add_lost_sn(lost_seqs.at(i));
+    }
+
+    srs_error_t err = nack.encode(&stream);
+    srs_assert(err == srs_success);
+    srs_freep(err);
+
+    return std::string(buf, stream.pos());
+}
+
+static std::string rtsp_test_interleaved(uint8_t channel, const std::string &payload)
+{
+    std::string frame;
+    frame.push_back('$');
+    frame.push_back((char)channel);
+    frame.push_back((char)(payload.length() >> 8));
+    frame.push_back((char)(payload.length() & 0xff));
+    frame += payload;
+    return frame;
+}
+
+class MockRtspTransportHandlerForNack : public ISrsRtspTransportHandler
+{
+public:
+    int count_;
+    uint8_t channel_;
+    uint32_t media_ssrc_;
+    std::vector<uint16_t> lost_seqs_;
+
+public:
+    MockRtspTransportHandlerForNack()
+    {
+        count_ = 0;
+        channel_ = 0;
+        media_ssrc_ = 0;
+    }
+    virtual ~MockRtspTransportHandlerForNack()
+    {
+    }
+
+public:
+    virtual srs_error_t on_rtcp(uint8_t channel, char *data, int size)
+    {
+        count_++;
+        channel_ = channel;
+
+        SrsBuffer stream(data, size);
+        SrsRtcpCompound compound;
+        srs_error_t err = compound.decode(&stream);
+        if (err != srs_success) {
+            return srs_error_wrap(err, "decode");
+        }
+
+        SrsRtcpCommon *rtcp = NULL;
+        while ((rtcp = compound.get_next_rtcp())) {
+            SrsRtcpNack *nack = dynamic_cast<SrsRtcpNack *>(rtcp);
+            if (!nack) {
+                srs_freep(rtcp);
+                continue;
+            }
+            media_ssrc_ = nack->get_media_ssrc();
+            lost_seqs_ = nack->get_lost_sns();
+            srs_freep(rtcp);
+        }
+
+        return srs_success;
+    }
+};
+
 // Mock ISrsAppConfig with an on_play and an on_stop hook, for the RTSP player's hook pairs.
 class MockAppConfigForRtspOnStop : public MockAppConfigForHttpHooksOnPlay
 {
@@ -4653,6 +4760,293 @@ VOID TEST(RtspStackTest, RequestBodyIsNotTheNextRequest)
         HELPER_EXPECT_FAILED(stack.recv_message(&req));
         EXPECT_TRUE(req == NULL);
     }
+}
+
+// A client may answer with RTCP on an interleaved channel while sending the next RTSP request. The
+// RTCP NACK must reach the transport handler, and the request after it must still parse.
+VOID TEST(RtspStackTest, InterleavedNackReachesHandler)
+{
+    srs_error_t err = srs_success;
+
+    MockRtspTransportHandlerForNack handler;
+    MockBufferIO bio;
+    SrsRtspStack stack(&bio);
+    stack.set_rtcp_handler(&handler);
+
+    std::vector<uint16_t> lost;
+    lost.push_back(5);
+    lost.push_back(6);
+    lost.push_back(7);
+    std::string nack = rtsp_test_nack(2001, lost);
+    std::string frame = rtsp_test_interleaved(5, nack);
+    std::string request = "OPTIONS rtsp://127.0.0.1/live/stream RTSP/1.0\r\nCSeq: 9\r\n\r\n";
+    std::string input = frame + request;
+    bio.in_buffer.append(input.data(), (int)input.length());
+
+    SrsRtspRequest *req = NULL;
+    HELPER_ASSERT_SUCCESS(stack.recv_message(&req));
+    SrsUniquePtr<SrsRtspRequest> req_uptr(req);
+
+    EXPECT_STREQ("OPTIONS", req->method_.c_str());
+    EXPECT_EQ(9, req->seq_);
+    EXPECT_EQ(1, handler.count_);
+    EXPECT_EQ(5, handler.channel_);
+    EXPECT_EQ(2001u, handler.media_ssrc_);
+    ASSERT_EQ(3, (int)handler.lost_seqs_.size());
+    EXPECT_EQ(5, handler.lost_seqs_[0]);
+    EXPECT_EQ(6, handler.lost_seqs_[1]);
+    EXPECT_EQ(7, handler.lost_seqs_[2]);
+}
+
+// SETUP names the RTP interleaved channel. The RTCP channel of the pair is where the client sends
+// NACKs, so the connection must remember it for the track's SSRC, and forget the old pair when the
+// track is set up again.
+VOID TEST(RtspConnectionTest, SetupRegistersRtcpChannel)
+{
+    srs_error_t err = srs_success;
+
+    SrsUniquePtr<SrsRtspConnection> conn(new SrsRtspConnection(NULL, NULL, "127.0.0.1", 8554));
+
+    SrsRtcTrackDescription *video_desc = new SrsRtcTrackDescription();
+    video_desc->type_ = "video";
+    video_desc->id_ = "0";
+    video_desc->ssrc_ = 2001;
+    conn->tracks_[2001] = video_desc;
+
+    SrsUniquePtr<SrsRtspRequest> req(new SrsRtspRequest());
+    req->method_ = "SETUP";
+    req->stream_id_ = 0;
+    req->transport_ = new SrsRtspTransport();
+    req->transport_->transport_ = "RTP";
+    req->transport_->profile_ = "AVP";
+    req->transport_->lower_transport_ = "TCP";
+    req->transport_->interleaved_min_ = 4;
+    req->transport_->interleaved_max_ = 5;
+
+    uint32_t ssrc = 0;
+    HELPER_EXPECT_SUCCESS(conn->do_setup(req.get(), &ssrc));
+    EXPECT_EQ(2001u, conn->rtcp_channels_[5]);
+
+    req->transport_->interleaved_min_ = 6;
+    req->transport_->interleaved_max_ = 7;
+    HELPER_EXPECT_SUCCESS(conn->do_setup(req.get(), &ssrc));
+    EXPECT_TRUE(conn->rtcp_channels_.find(5) == conn->rtcp_channels_.end());
+    EXPECT_EQ(2001u, conn->rtcp_channels_[7]);
+}
+
+// An RTCP Generic NACK arrives on the RTCP channel of a track, and the player gets its media SSRC
+// and lost sequence numbers. Other channels and malformed RTCP are ignored without closing the
+// connection.
+VOID TEST(RtspConnectionTest, DispatchesInterleavedNackToPlayer)
+{
+    srs_error_t err = srs_success;
+
+    SrsUniquePtr<SrsRtspConnection> conn(new SrsRtspConnection(NULL, NULL, "127.0.0.1", 8554));
+    MockRtspPlayStream *player = new MockRtspPlayStream();
+    conn->player_ = player;
+    conn->rtcp_channels_[1] = 2001;
+
+    std::vector<uint16_t> lost;
+    lost.push_back(7);
+    lost.push_back(5);
+    lost.push_back(6);
+    std::string nack = rtsp_test_nack(2001, lost);
+    HELPER_EXPECT_SUCCESS(conn->on_rtcp(1, &nack[0], (int)nack.length()));
+
+    EXPECT_EQ(1, player->on_rtcp_nack_count_);
+    EXPECT_EQ(2001u, player->last_nack_ssrc_);
+    ASSERT_EQ(3, (int)player->last_nack_seqs_.size());
+    EXPECT_EQ(5, player->last_nack_seqs_[0]);
+    EXPECT_EQ(6, player->last_nack_seqs_[1]);
+    EXPECT_EQ(7, player->last_nack_seqs_[2]);
+
+    // An RTCP channel that SETUP did not name is not for any track of this connection.
+    HELPER_EXPECT_SUCCESS(conn->on_rtcp(3, &nack[0], (int)nack.length()));
+    EXPECT_EQ(1, player->on_rtcp_nack_count_);
+
+    // A malformed RTCP does not end the session, and still asks for no retransmission.
+    char bad[] = {0x00, 0x01};
+    HELPER_EXPECT_SUCCESS(conn->on_rtcp(1, bad, sizeof(bad)));
+    EXPECT_EQ(1, player->on_rtcp_nack_count_);
+
+    // A frame with a valid NACK and a short, non-aligned tail is ignored as a whole.
+    std::string trailing = nack + "xy";
+    HELPER_EXPECT_SUCCESS(conn->on_rtcp(1, &trailing[0], (int)trailing.length()));
+    EXPECT_EQ(1, player->on_rtcp_nack_count_);
+}
+
+// The cache keeps the sent RTP packets, so a NACK resends exactly the packets requested, in the
+// order the client asked for them. The client may ask in any order, such as a late NACK for an
+// older sequence after a newer one.
+VOID TEST(RtspSendTrackTest, NackResendsCachedPacketsInRequestOrder)
+{
+    srs_error_t err = srs_success;
+
+    MockRtspConnection session;
+    SrsUniquePtr<SrsRtcTrackDescription> desc(new SrsRtcTrackDescription());
+    desc->type_ = "video";
+    desc->id_ = "video-1";
+    desc->ssrc_ = 2001;
+    desc->is_active_ = true;
+    desc->media_ = new SrsVideoPayload(96, "H264", 90000);
+
+    SrsUniquePtr<SrsRtspVideoSendTrack> track(new SrsRtspVideoSendTrack(&session, desc.get()));
+
+    const uint16_t sequences[] = {101, 103, 102};
+    for (int i = 0; i < (int)(sizeof(sequences) / sizeof(sequences[0])); i++) {
+        SrsUniquePtr<SrsRtpPacket> pkt(new SrsRtpPacket());
+        pkt->wrap(16);
+        pkt->header_.set_ssrc(2001);
+        pkt->header_.set_sequence(sequences[i]);
+        pkt->header_.set_timestamp(90000 + i);
+        pkt->header_.set_payload_type(96);
+        HELPER_EXPECT_SUCCESS(track->on_rtp(pkt.get()));
+    }
+    EXPECT_EQ(3, session.do_send_packet_count_);
+
+    session.reset();
+    std::vector<uint16_t> lost;
+    lost.push_back(103);
+    lost.push_back(101);
+    lost.push_back(102);
+    HELPER_EXPECT_SUCCESS(track->on_nack(lost));
+
+    EXPECT_EQ(3, session.do_send_packet_count_);
+    ASSERT_EQ(3, (int)session.sequences_.size());
+    EXPECT_EQ(103, session.sequences_[0]);
+    EXPECT_EQ(101, session.sequences_[1]);
+    EXPECT_EQ(102, session.sequences_[2]);
+
+    // A sequence the cache no longer has, or never had, is ignored.
+    session.reset();
+    lost.clear();
+    lost.push_back(999);
+    HELPER_EXPECT_SUCCESS(track->on_nack(lost));
+    EXPECT_EQ(0, session.do_send_packet_count_);
+}
+
+// The cache is bounded. When it wraps, the oldest packet is gone, and a NACK for it is ignored,
+// while a NACK for the newest packet still resends.
+VOID TEST(RtspSendTrackTest, NackIgnoresEvictedPacket)
+{
+    srs_error_t err = srs_success;
+
+    MockRtspConnection session;
+    SrsUniquePtr<SrsRtcTrackDescription> desc(new SrsRtcTrackDescription());
+    desc->type_ = "audio";
+    desc->id_ = "audio-1";
+    desc->ssrc_ = 1001;
+    desc->is_active_ = true;
+
+    SrsUniquePtr<SrsRtspAudioSendTrack> track(new SrsRtspAudioSendTrack(&session, desc.get()));
+
+    for (int i = 0; i <= 100; i++) {
+        SrsUniquePtr<SrsRtpPacket> pkt(new SrsRtpPacket());
+        pkt->wrap(16);
+        pkt->header_.set_ssrc(1001);
+        pkt->header_.set_sequence((uint16_t)i);
+        HELPER_EXPECT_SUCCESS(track->on_rtp(pkt.get()));
+    }
+    EXPECT_EQ(101, session.do_send_packet_count_);
+
+    session.reset();
+    std::vector<uint16_t> lost;
+    lost.push_back(0);
+    HELPER_EXPECT_SUCCESS(track->on_nack(lost));
+    EXPECT_EQ(0, session.do_send_packet_count_);
+
+    lost.clear();
+    lost.push_back(100);
+    HELPER_EXPECT_SUCCESS(track->on_nack(lost));
+    EXPECT_EQ(1, session.do_send_packet_count_);
+    ASSERT_EQ(1, (int)session.sequences_.size());
+    EXPECT_EQ(100, session.sequences_[0]);
+}
+
+// The play stream owns the tracks and is what the connection can reach, so it routes a NACK by the
+// media SSRC to one track only.
+VOID TEST(RtspPlayStreamTest, RtcpNackRoutesToMatchingTrack)
+{
+    srs_error_t err = srs_success;
+
+    MockRtspConnection session;
+    MockStatisticForRtspPlayStream stat;
+    SrsContextId cid;
+    SrsUniquePtr<SrsRtspPlayStream> play(new SrsRtspPlayStream(&session, cid));
+    play->stat_ = &stat;
+
+    SrsUniquePtr<SrsRtcTrackDescription> audio_desc(new SrsRtcTrackDescription());
+    audio_desc->type_ = "audio";
+    audio_desc->id_ = "audio-1";
+    audio_desc->ssrc_ = 1001;
+    SrsUniquePtr<SrsRtcTrackDescription> video_desc(new SrsRtcTrackDescription());
+    video_desc->type_ = "video";
+    video_desc->id_ = "video-1";
+    video_desc->ssrc_ = 2001;
+
+    MockRtspSendTrack *audio = new MockRtspSendTrack("audio-1", audio_desc.get());
+    MockRtspSendTrack *video = new MockRtspSendTrack("video-1", video_desc.get());
+    play->audio_tracks_[1001] = audio;
+    play->video_tracks_[2001] = video;
+
+    std::vector<uint16_t> lost;
+    lost.push_back(3);
+    lost.push_back(1);
+    lost.push_back(2);
+    HELPER_EXPECT_SUCCESS(play->on_rtcp_nack(2001, lost));
+
+    EXPECT_EQ(0, audio->on_nack_count_);
+    EXPECT_EQ(1, video->on_nack_count_);
+    EXPECT_EQ(lost, video->nack_seqs_);
+
+    HELPER_EXPECT_SUCCESS(play->on_rtcp_nack(9999, lost));
+    EXPECT_EQ(0, audio->on_nack_count_);
+    EXPECT_EQ(1, video->on_nack_count_);
+}
+
+// A republish can reuse sequence numbers. The old packets must not answer a NACK for the new
+// stream, so the play stream clears every track's retransmission cache when the source changes.
+VOID TEST(RtspPlayStreamTest, OnStreamChangeClearsRetransmissionCache)
+{
+    srs_error_t err = srs_success;
+
+    MockRtspConnection session;
+    MockStatisticForRtspPlayStream stat;
+    SrsContextId cid;
+    SrsUniquePtr<SrsRtspPlayStream> play(new SrsRtspPlayStream(&session, cid));
+    play->stat_ = &stat;
+
+    SrsUniquePtr<SrsRtcTrackDescription> desc(new SrsRtcTrackDescription());
+    desc->type_ = "video";
+    desc->id_ = "video-1";
+    desc->ssrc_ = 2001;
+    desc->is_active_ = true;
+    desc->media_ = new SrsVideoPayload(96, "H264", 90000);
+
+    SrsRtspVideoSendTrack *track = new SrsRtspVideoSendTrack(&session, desc.get());
+    play->video_tracks_[2001] = track;
+
+    SrsUniquePtr<SrsRtpPacket> pkt(new SrsRtpPacket());
+    pkt->wrap(16);
+    pkt->header_.set_ssrc(2001);
+    pkt->header_.set_sequence(77);
+    pkt->header_.set_payload_type(96);
+    HELPER_EXPECT_SUCCESS(track->on_rtp(pkt.get()));
+    EXPECT_EQ(1, session.do_send_packet_count_);
+
+    SrsUniquePtr<SrsRtcSourceDescription> changed(new SrsRtcSourceDescription());
+    SrsRtcTrackDescription *video = new SrsRtcTrackDescription();
+    video->type_ = "video";
+    video->ssrc_ = 2002;
+    video->media_ = new SrsVideoPayload(96, "H264", 90000);
+    changed->video_track_descs_.push_back(video);
+    play->on_stream_change(changed.get());
+
+    session.reset();
+    std::vector<uint16_t> lost;
+    lost.push_back(77);
+    HELPER_EXPECT_SUCCESS(play->on_rtcp_nack(2001, lost));
+    EXPECT_EQ(0, session.do_send_packet_count_);
 }
 #endif
 

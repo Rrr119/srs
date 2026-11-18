@@ -13,6 +13,7 @@
 #include <srs_kernel_rtc_rtp.hpp>
 #include <srs_kernel_utility.hpp>
 #include <srs_protocol_conn.hpp>
+#include <srs_protocol_rtsp_stack.hpp>
 #include <srs_protocol_st.hpp>
 
 #include <map>
@@ -55,6 +56,8 @@ public:
     virtual void stop() = 0;
     // Directly set the status of track, generally for init to set the default value.
     virtual void set_all_tracks_status(bool status) = 0;
+    // Resend the packets requested by an RTCP Generic NACK.
+    virtual srs_error_t on_rtcp_nack(uint32_t ssrc, const std::vector<uint16_t> &lost_seqs) = 0;
 };
 
 // A RTSP play stream, client pull and play stream from SRS.
@@ -122,6 +125,7 @@ SRS_DECLARE_PRIVATE: // clang-format on
 public:
     // Directly set the status of track, generally for init to set the default value.
     void set_all_tracks_status(bool status);
+    virtual srs_error_t on_rtcp_nack(uint32_t ssrc, const std::vector<uint16_t> &lost_seqs);
 };
 
 // The handler for RTSP connection send packet.
@@ -140,7 +144,8 @@ class SrsRtspConnection : public ISrsResource, // It's a resource.
                           public ISrsDisposingHandler,
                           public ISrsCoroutineHandler,
                           public ISrsStartable,
-                          public ISrsRtspConnection
+                          public ISrsRtspConnection,
+                          public ISrsRtspTransportHandler
 {
 // clang-format off
 SRS_DECLARE_PRIVATE: // clang-format on
@@ -181,6 +186,8 @@ SRS_DECLARE_PRIVATE: // clang-format on
     ISrsEphemeralDelta *delta_;
     // The client's socket, owned: freed by the destructor, which closes the connection.
     ISrsProtocolReadWriter *skt_;
+    // Serializes interleaved writes from the player and RTCP NACK retransmission.
+    srs_mutex_t send_lock_;
     ISrsSecurity *security_;
     iovec *cache_iov_;
     SrsBuffer *cache_buffer_;
@@ -188,6 +195,8 @@ SRS_DECLARE_PRIVATE: // clang-format on
     std::map<uint32_t, SrsRtcTrackDescription *> tracks_;
     // key: ssrc
     std::map<uint32_t, ISrsStreamWriter *> networks_;
+    // key: RTCP interleaved channel, value: SSRC
+    std::map<int, uint32_t> rtcp_channels_;
     ISrsRtspPlayStream *player_;
     // Whether an on_play passed for request_, so the play owes the hook server its on_stop.
     bool on_play_passed_;
@@ -203,6 +212,7 @@ public:
 
 public:
     virtual srs_error_t do_send_packet(SrsRtpPacket *pkt);
+    virtual srs_error_t on_rtcp(uint8_t channel, char *data, int size);
 
 public:
     ISrsKbpsDelta *delta();

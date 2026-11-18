@@ -157,6 +157,7 @@ class MockRtspConnection : public ISrsRtspConnection
 public:
     int do_send_packet_count_;
     SrsRtpPacket *last_packet_;
+    std::vector<uint16_t> sequences_;
     srs_error_t send_error_;
 
 public:

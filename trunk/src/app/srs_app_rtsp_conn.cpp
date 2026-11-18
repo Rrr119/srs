@@ -26,6 +26,7 @@ using namespace std;
 #include <srs_kernel_kbps.hpp>
 #include <srs_kernel_log.hpp>
 #include <srs_kernel_pithy_print.hpp>
+#include <srs_kernel_rtc_rtcp.hpp>
 #include <srs_kernel_rtc_rtp.hpp>
 #ifdef SRS_RTSP
 #include <srs_protocol_rtsp_stack.hpp>
@@ -141,6 +142,14 @@ void SrsRtspPlayStream::on_stream_change(SrsRtcSourceDescription *desc)
     // the old ones, starts over; otherwise every packet of the new stream misses it from now on.
     cache_ssrc0_ = cache_ssrc1_ = cache_ssrc2_ = 0;
     cache_track0_ = cache_track1_ = cache_track2_ = NULL;
+
+    std::map<uint32_t, ISrsRtspSendTrack *>::iterator it;
+    for (it = audio_tracks_.begin(); it != audio_tracks_.end(); ++it) {
+        it->second->reset_rtp_cache();
+    }
+    for (it = video_tracks_.begin(); it != video_tracks_.end(); ++it) {
+        it->second->reset_rtp_cache();
+    }
 
     // Refresh the relation for audio.
     // TODO: FIXME: Match by label?
@@ -341,6 +350,27 @@ srs_error_t SrsRtspPlayStream::send_packet(SrsRtpPacket *&pkt)
     return err;
 }
 
+srs_error_t SrsRtspPlayStream::on_rtcp_nack(uint32_t ssrc, const std::vector<uint16_t> &lost_seqs)
+{
+    srs_error_t err = srs_success;
+
+    std::map<uint32_t, ISrsRtspSendTrack *>::iterator it;
+    for (it = audio_tracks_.begin(); it != audio_tracks_.end(); ++it) {
+        ISrsRtspSendTrack *track = it->second;
+        if (track->track_desc()->ssrc_ == ssrc) {
+            return track->on_nack(lost_seqs);
+        }
+    }
+    for (it = video_tracks_.begin(); it != video_tracks_.end(); ++it) {
+        ISrsRtspSendTrack *track = it->second;
+        if (track->track_desc()->ssrc_ == ssrc) {
+            return track->on_nack(lost_seqs);
+        }
+    }
+
+    return err;
+}
+
 void SrsRtspPlayStream::set_all_tracks_status(bool status)
 {
     std::ostringstream merged_log;
@@ -397,6 +427,7 @@ SrsRtspConnection::SrsRtspConnection(ISrsResourceManager *cm, ISrsProtocolReadWr
 
     // Initialize merged SrsRtspSession members
     skt_ = skt;
+    send_lock_ = srs_mutex_new();
     source_ = NULL;
     player_ = NULL;
     on_play_passed_ = false;
@@ -425,6 +456,9 @@ void SrsRtspConnection::assemble()
     context_->set_id(cid_);
 
     trd_ = app_factory_->create_coroutine("rtsp", this, context_->get_id());
+    if (rtsp_) {
+        rtsp_->set_rtcp_handler(this);
+    }
 
     rtsp_manager_->subscribe(this);
 }
@@ -461,6 +495,7 @@ SrsRtspConnection::~SrsRtspConnection()
         srs_freep(cache_iov_);
     }
     srs_freep(cache_buffer_);
+    srs_mutex_destroy(send_lock_);
 
     // The connection owns the client's socket, which the stack and the TCP networks only borrow, so
     // free it after them; this closes the TCP connection.
@@ -478,6 +513,7 @@ SrsRtspConnection::~SrsRtspConnection()
 srs_error_t SrsRtspConnection::do_send_packet(SrsRtpPacket *pkt)
 {
     srs_error_t err = srs_success;
+    SrsLocker(&send_lock_);
 
     uint32_t ssrc = pkt->header_.get_ssrc();
     // Look up without inserting: this runs for every RTP packet, and operator[] would default-insert
@@ -505,6 +541,64 @@ srs_error_t SrsRtspConnection::do_send_packet(SrsRtpPacket *pkt)
     }
 
     delta_->add_delta(0, write);
+
+    return err;
+}
+
+srs_error_t SrsRtspConnection::on_rtcp(uint8_t channel, char *data, int size)
+{
+    srs_error_t err = srs_success;
+
+    if (!player_) {
+        return err;
+    }
+
+    std::map<int, uint32_t>::iterator it = rtcp_channels_.find((int)channel);
+    if (it == rtcp_channels_.end()) {
+        srs_info("RTSP: ignore RTCP on channel=%u without a track", channel);
+        return err;
+    }
+    uint32_t channel_ssrc = it->second;
+
+    if (size < 8 || (size % 4) != 0) {
+        srs_info("RTSP: ignore invalid RTCP on channel=%u, size=%d", channel, size);
+        return err;
+    }
+
+    SrsRtcpCompound compound;
+    SrsBuffer stream(data, size);
+    if ((err = compound.decode(&stream)) != srs_success) {
+        srs_warn("RTSP: ignore invalid RTCP on channel=%u, %s", channel, srs_error_desc(err).c_str());
+        srs_freep(err);
+        return srs_success;
+    }
+
+    SrsRtcpCommon *rtcp = NULL;
+    while ((rtcp = compound.get_next_rtcp())) {
+        SrsUniquePtr<SrsRtcpCommon> rtcp_uptr(rtcp);
+
+        if (rtcp->type() != SrsRtcpType_rtpfb || rtcp->get_rc() != 1) {
+            continue;
+        }
+
+        SrsRtcpNack *nack = dynamic_cast<SrsRtcpNack *>(rtcp);
+        if (!nack) {
+            continue;
+        }
+
+        std::vector<uint16_t> lost_seqs = nack->get_lost_sns();
+        if (lost_seqs.empty()) {
+            continue;
+        }
+
+        uint32_t media_ssrc = nack->get_media_ssrc();
+        if (!media_ssrc) {
+            media_ssrc = channel_ssrc;
+        }
+        if ((err = player_->on_rtcp_nack(media_ssrc, lost_seqs)) != srs_success) {
+            return srs_error_wrap(err, "handle nack, ssrc=%u, lost=%d", media_ssrc, (int)lost_seqs.size());
+        }
+    }
 
     return err;
 }
@@ -908,6 +1002,7 @@ srs_error_t SrsRtspConnection::do_describe(SrsRtspRequest *req, std::string &sdp
         SrsMediaPayloadType &ps_audio = media_audio.payload_types_.at(0);
         ps_audio.encoding_name_ = audio_track_desc->media_->name_;
         ps_audio.clock_rate_ = audio_track_desc->media_->sample_;
+        ps_audio.rtcp_fb_.push_back("nack");
 
         // if the payload is opus, and the encoding_param_ is channel
         SrsAudioPayload *ap = dynamic_cast<SrsAudioPayload *>(audio_track_desc->media_);
@@ -949,6 +1044,7 @@ srs_error_t SrsRtspConnection::do_describe(SrsRtspRequest *req, std::string &sdp
         SrsMediaPayloadType &ps_video = media_video.payload_types_.at(0);
         ps_video.encoding_name_ = video_track_desc->media_->name_;
         ps_video.clock_rate_ = video_track_desc->media_->sample_;
+        ps_video.rtcp_fb_.push_back("nack");
 
         local_sdp.media_descs_.push_back(media_video);
         track_id++;
@@ -965,6 +1061,14 @@ srs_error_t SrsRtspConnection::do_describe(SrsRtspRequest *req, std::string &sdp
         }
         srs_freep(network);
         networks_.erase(it++);
+
+        for (std::map<int, uint32_t>::iterator cit = rtcp_channels_.begin(); cit != rtcp_channels_.end();) {
+            if (cit->second == ssrc) {
+                rtcp_channels_.erase(cit++);
+            } else {
+                ++cit;
+            }
+        }
     }
 
     if (track_id == 0) {
@@ -1002,6 +1106,18 @@ srs_error_t SrsRtspConnection::do_setup(SrsRtspRequest *req, uint32_t *pssrc)
     ISrsStreamWriter *&slot = networks_[ssrc];
     srs_freep(slot);
     networks_[ssrc] = network;
+
+    for (std::map<int, uint32_t>::iterator it = rtcp_channels_.begin(); it != rtcp_channels_.end();) {
+        if (it->second == ssrc) {
+            rtcp_channels_.erase(it++);
+        } else {
+            ++it;
+        }
+    }
+    int rtcp_channel = req->transport_->interleaved_max_ > req->transport_->interleaved_min_
+                           ? req->transport_->interleaved_max_
+                           : req->transport_->interleaved_min_ + 1;
+    rtcp_channels_[rtcp_channel] = ssrc;
 
     *pssrc = ssrc;
 
@@ -1057,6 +1173,7 @@ srs_error_t SrsRtspConnection::do_teardown()
         srs_freep(network);
     }
     networks_.clear();
+    rtcp_channels_.clear();
 
     return srs_success;
 }
